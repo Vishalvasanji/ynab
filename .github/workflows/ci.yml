@@ -1,0 +1,56 @@
+name: CI
+
+# Auto-tests the ynab-import skill on every push/PR. No secrets, no writes to
+# your budget — it only runs an offline dry-run against the committed fixture.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile-check the script
+        run: python -m py_compile scripts/ynab_import.py
+
+      - name: Dry-run against the sample fixture (offline, no token)
+        run: |
+          out="$(python3 scripts/ynab_import.py references/sample.csv --dry-run)"
+          echo "$out"
+          echo "$out" | grep -q "DRY RUN: nothing was sent to YNAB." \
+            || { echo "::error::dry-run did not complete cleanly"; exit 1; }
+          echo "$out" | grep -q "1 transfers skipped" \
+            || { echo "::error::transfer row was not skipped"; exit 1; }
+          echo "$out" | grep -q "1 zero rows skipped" \
+            || { echo "::error::zero-dollar row was not skipped"; exit 1; }
+
+      - name: Assert import_id format and payee/amount handling
+        run: |
+          python3 - <<'PY'
+          import sys; sys.path.insert(0, "scripts")
+          import ynab_import as y
+          rows = y.read_bank_csv("references/sample.csv")
+          txns, stats = y.process_rows(
+              rows, y.load_category_map("references/category_map.json"), False)
+          ids = [t["import_id"] for t in txns]
+          # exact YNAB:[milli]:[date]:[occurrence] format
+          import re
+          assert all(re.fullmatch(r"YNAB:-?\d+:\d{4}-\d{2}-\d{2}:\d+", i) for i in ids), ids
+          # same date + amount -> occurrence increments
+          assert "YNAB:-13000:2026-06-10:1" in ids and "YNAB:-13000:2026-06-10:2" in ids, ids
+          # -$24.88 -> -24880 milliunits + payee cleanup
+          taco = next(t for t in txns if "TACO BELL" in t["payee"])
+          assert taco["amount_milli"] == -24880, taco
+          assert taco["payee"] == "TACO BELL 034632 BATON ROUGE", taco["payee"]
+          print("OK: import_id, milliunits, and payee assertions passed")
+          PY

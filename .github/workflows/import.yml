@@ -1,0 +1,78 @@
+name: YNAB Import
+
+# Imports bank-export CSVs into your YNAB budget.
+#
+# Runs two ways:
+#   * Manual  — Actions tab -> "YNAB Import" -> "Run workflow" (one click).
+#   * Monthly — automatically on the 1st of each month.
+#
+# It imports every CSV found in the inbox/ folder. Safe to re-run: the skill
+# deduplicates via YNAB's native import_id, so the same export never creates
+# duplicates. If inbox/ has no CSV, the run is a clean no-op.
+#
+# One-time setup (Settings -> Secrets and variables -> Actions):
+#   Secret    YNAB_ACCESS_TOKEN   your YNAB Personal Access Token
+#   Variable  YNAB_BUDGET_ID      target budget UUID  (from --list-budgets)
+#   Variable  YNAB_ACCOUNT_ID     target account UUID (from --list-accounts)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only — do not write to YNAB"
+        type: boolean
+        default: false
+  schedule:
+    # 13:00 UTC on the 1st of every month
+    - cron: "0 13 1 * *"
+
+# Don't let two imports race against the same budget.
+concurrency:
+  group: ynab-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check configuration
+        env:
+          YNAB_ACCESS_TOKEN: ${{ secrets.YNAB_ACCESS_TOKEN }}
+          YNAB_BUDGET_ID: ${{ vars.YNAB_BUDGET_ID }}
+          YNAB_ACCOUNT_ID: ${{ vars.YNAB_ACCOUNT_ID }}
+        run: |
+          missing=0
+          [ -n "$YNAB_ACCESS_TOKEN" ] || { echo "::error::secret YNAB_ACCESS_TOKEN is not set"; missing=1; }
+          [ -n "$YNAB_BUDGET_ID" ]    || { echo "::error::variable YNAB_BUDGET_ID is not set"; missing=1; }
+          [ -n "$YNAB_ACCOUNT_ID" ]   || { echo "::error::variable YNAB_ACCOUNT_ID is not set"; missing=1; }
+          [ "$missing" -eq 0 ] || { echo "See the setup notes at the top of .github/workflows/import.yml"; exit 1; }
+
+      - name: Import inbox CSVs
+        env:
+          YNAB_ACCESS_TOKEN: ${{ secrets.YNAB_ACCESS_TOKEN }}
+          YNAB_BUDGET_ID: ${{ vars.YNAB_BUDGET_ID }}
+          YNAB_ACCOUNT_ID: ${{ vars.YNAB_ACCOUNT_ID }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          shopt -s nullglob
+          files=(inbox/*.csv inbox/*.CSV)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No CSVs in inbox/ — nothing to import. (Drop an export there to import it.)"
+            exit 0
+          fi
+          flag=""
+          [ "$DRY_RUN" = "true" ] && flag="--dry-run"
+          for f in "${files[@]}"; do
+            echo "::group::Importing $f $flag"
+            python3 scripts/ynab_import.py "$f" \
+              --budget-id "$YNAB_BUDGET_ID" \
+              --account-id "$YNAB_ACCOUNT_ID" \
+              $flag
+            echo "::endgroup::"
+          done
