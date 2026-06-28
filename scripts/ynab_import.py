@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-ynab_import.py — load a bank-export CSV into a YNAB budget via the YNAB API.
+ynab_import.py — bridge between a bank-export CSV and a YNAB budget.
 
-Runs once a month against a fresh bank export. Safe to re-run: overlapping
-exports never create duplicates because every transaction carries a
-deterministic YNAB `import_id`.
+This script is the mechanical half of the `ynab-import` skill. The *intelligence*
+(matching merchants to your real payees and categories, and asking you when it's
+ambiguous) lives in Claude, which drives this script in two phases:
 
-Standard library only (no pip dependencies) for portability.
+    1. prepare  — parse the CSV and fetch your LIVE categories + payees, emitting
+                  one structured JSON blob for Claude to reason over.
+    2. apply    — take the resolved transactions Claude produced and create them
+                  in YNAB (deduplicated, landing in the approval queue).
 
-SECURITY: the YNAB access token is a long-lived read/write secret. This script
-reads it ONLY from the YNAB_ACCESS_TOKEN environment variable. It never reads a
-token from a file in the repo, never prints it, and never writes it to disk.
+Standard library only (no pip dependencies).
+
+SECURITY: the YNAB access token is a long-lived read/write secret. It is read
+ONLY from the YNAB_ACCESS_TOKEN environment variable — never from a file in the
+repo, never printed, never written to disk. Budget/account IDs are NOT secrets
+and may come from flags, the YNAB_BUDGET_ID / YNAB_ACCOUNT_ID env vars, or the
+local config file.
 """
 
 import argparse
@@ -55,7 +62,7 @@ PAYEE_PREFIXES = [
 # CSV reader — isolated so that a different bank's columns only touch this fn.
 # --------------------------------------------------------------------------- #
 def read_bank_csv(path):
-    """Read the bank export. Yields dicts with raw string fields:
+    """Read the bank export. Returns a list of dicts with raw string fields:
     {date, type, description, debit, credit, check_number}.
 
     Columns expected (header row present), in order:
@@ -71,7 +78,6 @@ def read_bank_csv(path):
             if header is None:
                 header = raw  # consume the header row
                 continue
-            # Pad short rows so trailing empty columns don't IndexError.
             cells = list(raw) + [""] * (6 - len(raw))
             rows.append({
                 "date": cells[0].strip(),
@@ -141,7 +147,6 @@ def clean_payee(description, check_number):
             cleaned = new
             break
 
-    # Collapse whitespace.
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     # Trim one trailing 2-letter US state code.
@@ -204,26 +209,29 @@ def _request(token, method, path, body=None):
 
 
 def list_budgets(token):
-    data = _request(token, "GET", "/budgets")
-    return data["data"]["budgets"]
+    return _request(token, "GET", "/budgets")["data"]["budgets"]
 
 
 def list_accounts(token, budget_id):
-    data = _request(token, "GET", f"/budgets/{budget_id}/accounts")
-    return data["data"]["accounts"]
+    return _request(token, "GET",
+                    f"/budgets/{budget_id}/accounts")["data"]["accounts"]
 
 
 def list_categories(token, budget_id):
-    data = _request(token, "GET", f"/budgets/{budget_id}/categories")
-    return data["data"]["category_groups"]
+    return _request(token, "GET",
+                    f"/budgets/{budget_id}/categories")["data"]["category_groups"]
+
+
+def list_payees(token, budget_id):
+    return _request(token, "GET",
+                    f"/budgets/{budget_id}/payees")["data"]["payees"]
 
 
 def create_transactions(token, budget_id, transactions):
-    data = _request(
+    return _request(
         token, "POST", f"/budgets/{budget_id}/transactions",
         {"transactions": transactions},
-    )
-    return data["data"]
+    )["data"]
 
 
 def build_category_index(category_groups):
@@ -239,6 +247,32 @@ def build_category_index(category_groups):
     return index
 
 
+def categories_for_output(category_groups):
+    """Flat [{id, name, group}] of live, usable categories."""
+    out = []
+    for group in category_groups:
+        if group.get("deleted") or group.get("hidden"):
+            continue
+        for cat in group.get("categories", []):
+            if cat.get("deleted") or cat.get("hidden"):
+                continue
+            out.append({"id": cat["id"], "name": cat["name"],
+                        "group": group["name"]})
+    return out
+
+
+def payees_for_output(payees):
+    """Flat [{id, name}] of live merchant payees (excludes deleted/transfer)."""
+    out = []
+    for p in payees:
+        if p.get("deleted"):
+            continue
+        if p.get("transfer_account_id"):
+            continue  # account-transfer payee, not a merchant
+        out.append({"id": p["id"], "name": p["name"]})
+    return out
+
+
 def resolve_inflow_category(index):
     """Return (name, category_id) for the budget's Ready-to-Assign category."""
     for name in ("Inflow: Ready to Assign", "Inflow: To be Budgeted"):
@@ -249,33 +283,27 @@ def resolve_inflow_category(index):
 
 
 # --------------------------------------------------------------------------- #
-# Category map
+# Category map (optional hint to reduce questions; the real call is Claude's)
 # --------------------------------------------------------------------------- #
 def load_category_map(path):
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
     except FileNotFoundError:
-        sys.stderr.write(f"WARNING: category map not found at {path}; "
-                         "everything will be uncategorized.\n")
         return []
     except (json.JSONDecodeError, OSError) as e:
-        sys.stderr.write(f"WARNING: could not read category map ({e}); "
-                         "everything will be uncategorized.\n")
+        sys.stderr.write(f"WARNING: could not read category map ({e}).\n")
         return []
-    # Preserve order; skip meta keys and non-list values.
     pairs = []
     for key, val in raw.items():
-        if key.startswith("_"):
-            continue
-        if not isinstance(val, list):
+        if key.startswith("_") or not isinstance(val, list):
             continue
         pairs.append((key, [str(s).upper() for s in val]))
     return pairs
 
 
 def categorize_outflow(description, category_map):
-    """Return the intended category NAME for an outflow, or None."""
+    """Return the hinted category NAME for an outflow, or None."""
     upper = (description or "").upper()
     for name, keywords in category_map:
         for kw in keywords:
@@ -307,12 +335,7 @@ def save_config(path, cfg):
 # Pipeline
 # --------------------------------------------------------------------------- #
 def process_rows(rows, category_map, keep_transfers):
-    """Turn raw CSV rows into transaction dicts + collect skip counts.
-
-    Returns (txns, stats). Each txn dict has:
-        date, amount_milli, is_inflow, payee, memo, category_name (intended),
-        raw_description
-    """
+    """Turn raw CSV rows into transaction dicts + collect skip counts."""
     txns = []
     stats = {"transfers": 0, "zero": 0, "bad_date": 0}
 
@@ -332,121 +355,209 @@ def process_rows(rows, category_map, keep_transfers):
 
         amount = credit if is_inflow else debit
         if amount is None:
-            # Neither column populated — treat as a zero/empty row.
             stats["zero"] += 1
             continue
-
-        # 1. Skip zero rows.
         if abs(amount) < 0.005:
             stats["zero"] += 1
             continue
-
-        # 2. Skip internal transfers (unless overridden).
         if not keep_transfers and TRANSFER_RE.search(row["description"] or ""):
             stats["transfers"] += 1
             continue
 
-        # 3. milliunits (outflow stays negative).
         amount_milli = to_milliunits(amount)
-
-        # 4. payee (capped to 50).
         payee = clean_payee(row["description"], row["check_number"])[:PAYEE_MAX]
-
-        # 5. memo = raw description, capped to 200.
         memo = (row["description"] or "")[:MEMO_MAX]
-
-        # 6. categorize (intended name; resolved against live budget later).
-        if is_inflow:
-            category_name = "__INFLOW__"
-        else:
-            category_name = categorize_outflow(row["description"], category_map)
+        category_name = ("__INFLOW__" if is_inflow
+                         else categorize_outflow(row["description"], category_map))
 
         txns.append({
             "date": iso,
             "amount_milli": amount_milli,
             "is_inflow": is_inflow,
-            "payee": payee,
+            "suggested_payee": payee,
             "memo": memo,
-            "category_name": category_name,
+            "hint_category_name": category_name,
             "raw_description": row["description"],
         })
 
-    # 7. import_ids (stable order = order encountered).
     build_import_ids(txns)
     return txns, stats
 
 
-def assign_category_ids(txns, cat_index):
-    """Resolve intended category names to live category_ids.
+# --------------------------------------------------------------------------- #
+# prepare
+# --------------------------------------------------------------------------- #
+def cmd_prepare(args, token, budget_id, account_id):
+    category_map = load_category_map(args.category_map)
+    rows = read_bank_csv(args.csv)
+    txns, stats = process_rows(rows, category_map, args.keep_transfers)
 
-    Mutates each txn: adds category_id (or None) and category_display.
-    """
-    inflow_name, inflow_id = resolve_inflow_category(cat_index)
+    categories = []
+    payees = []
+    cat_index = {}
+    inflow_name = inflow_id = None
+    if token and budget_id:
+        try:
+            groups = list_categories(token, budget_id)
+            categories = categories_for_output(groups)
+            cat_index = build_category_index(groups)
+            inflow_name, inflow_id = resolve_inflow_category(cat_index)
+            payees = payees_for_output(list_payees(token, budget_id))
+        except YNABError as e:
+            sys.stderr.write(
+                f"WARNING: could not fetch live categories/payees ({e}). "
+                "Emitting transactions only.\n")
+    elif not token:
+        sys.stderr.write(
+            "WARNING: no YNAB_ACCESS_TOKEN; emitting transactions without "
+            "live categories/payees.\n")
+
+    # Attach the keyword-map hint as a category_id when the name exists live.
     for t in txns:
-        if t["category_name"] == "__INFLOW__":
-            t["category_id"] = inflow_id
-            t["category_display"] = inflow_name or "(uncategorized)"
-        elif t["category_name"]:
-            cid = cat_index.get(t["category_name"].lower())
-            t["category_id"] = cid
-            if cid:
-                t["category_display"] = t["category_name"]
-            else:
-                # Mapped name not in budget -> uncategorized, but note intent.
-                t["category_display"] = f"{t['category_name']} (not in budget)"
+        hint = t.pop("hint_category_name")
+        if hint == "__INFLOW__":
+            t["inflow"] = True
+            t["hint_category_id"] = inflow_id
+            t["hint_category_name"] = inflow_name
         else:
-            t["category_id"] = None
-            t["category_display"] = "(uncategorized)"
+            t["inflow"] = False
+            cid = cat_index.get(hint.lower()) if hint else None
+            t["hint_category_id"] = cid
+            t["hint_category_name"] = hint if cid else None
+
+    out = {
+        "budget_id": budget_id,
+        "account_id": account_id,
+        "inflow_category": ({"id": inflow_id, "name": inflow_name}
+                            if inflow_id else None),
+        "categories": categories,
+        "payees": payees,
+        "transactions": txns,
+        "skipped": stats,
+    }
+    json.dump(out, sys.stdout, indent=2)
+    sys.stdout.write("\n")
 
 
 # --------------------------------------------------------------------------- #
-# Output
+# apply
 # --------------------------------------------------------------------------- #
-def fmt_amount(milli):
-    return f"{milli / 1000:,.2f}"
-
-
-def print_preview(txns, stats):
-    if not txns:
-        print("No transactions to import.")
-    else:
-        date_w, amt_w, cat_w = 10, 12, 24
-        print(f"{'DATE':<{date_w}}  {'AMOUNT':>{amt_w}}  "
-              f"{'CATEGORY':<{cat_w}}  PAYEE")
-        print("-" * (date_w + amt_w + cat_w + 4 + 20))
-        for t in txns:
-            print(f"{t['date']:<{date_w}}  {fmt_amount(t['amount_milli']):>{amt_w}}  "
-                  f"{t['category_display'][:cat_w]:<{cat_w}}  {t['payee']}")
-
-    categorized = sum(1 for t in txns if t.get("category_id"))
-    uncategorized = len(txns) - categorized
-    print()
-    print(f"Summary: {len(txns)} to import "
-          f"({categorized} categorized, {uncategorized} uncategorized); "
-          f"{stats['transfers']} transfers skipped, "
-          f"{stats['zero']} zero rows skipped"
-          + (f", {stats['bad_date']} bad-date rows skipped"
-             if stats["bad_date"] else "")
-          + ".")
-
-
-def build_api_transactions(txns, account_id):
+def build_api_transactions(resolved, account_id):
+    """Turn Claude's resolved transactions into YNAB API objects."""
     out = []
-    for t in txns:
+    for i, t in enumerate(resolved):
+        date = t.get("date")
+        amount = t.get("amount_milli", t.get("amount"))
+        import_id = t.get("import_id")
+        if date is None or amount is None or not import_id:
+            raise YNABError(
+                f"resolved transaction #{i} is missing date/amount_milli/"
+                f"import_id: {t!r}")
         obj = {
             "account_id": account_id,
-            "date": t["date"],
-            "amount": t["amount_milli"],
-            "payee_name": t["payee"],
-            "memo": t["memo"],
+            "date": date,
+            "amount": int(amount),
             "cleared": "cleared",
             "approved": False,
-            "import_id": t["import_id"][:IMPORT_ID_MAX],
+            "import_id": str(import_id)[:IMPORT_ID_MAX],
         }
+        if t.get("payee_id"):
+            obj["payee_id"] = t["payee_id"]
+        elif t.get("payee_name"):
+            obj["payee_name"] = str(t["payee_name"])[:PAYEE_MAX]
         if t.get("category_id"):
             obj["category_id"] = t["category_id"]
+        if t.get("memo"):
+            obj["memo"] = str(t["memo"])[:MEMO_MAX]
         out.append(obj)
     return out
+
+
+def cmd_apply(args, token, budget_id, account_id):
+    try:
+        with open(args.resolved, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        sys.stderr.write(f"ERROR: could not read resolved file: {e}\n")
+        sys.exit(1)
+
+    resolved = doc.get("transactions", doc) if isinstance(doc, dict) else doc
+    if not isinstance(resolved, list):
+        sys.stderr.write("ERROR: resolved file must be a list of transactions "
+                         "or an object with a 'transactions' list.\n")
+        sys.exit(1)
+
+    # account_id may be carried in the resolved doc.
+    if isinstance(doc, dict) and doc.get("account_id"):
+        account_id = account_id or doc["account_id"]
+    if isinstance(doc, dict) and doc.get("budget_id"):
+        budget_id = budget_id or doc["budget_id"]
+
+    if not budget_id or not account_id:
+        sys.stderr.write(
+            "ERROR: no budget/account configured. Pass --budget-id/--account-id, "
+            "set YNAB_BUDGET_ID/YNAB_ACCOUNT_ID, or include them in the resolved "
+            "file.\n")
+        sys.exit(1)
+
+    try:
+        api_txns = build_api_transactions(resolved, account_id)
+    except YNABError as e:
+        sys.stderr.write(f"ERROR: {e}\n")
+        sys.exit(1)
+
+    if not api_txns:
+        print("Nothing to import.")
+        return
+
+    if args.dry_run:
+        print(json.dumps({"would_create": api_txns}, indent=2))
+        print(f"\nDRY RUN: {len(api_txns)} transactions ready; "
+              "nothing was sent to YNAB.")
+        return
+
+    token = token or require_token()
+    try:
+        result = create_transactions(token, budget_id, api_txns)
+    except YNABError as e:
+        sys.stderr.write(f"ERROR: {e}\n")
+        sys.exit(1)
+
+    created = len(result.get("transaction_ids", []))
+    dupes = len(result.get("duplicate_import_ids", []))
+    print(f"DONE: {created} created, {dupes} skipped as duplicates.")
+
+
+# --------------------------------------------------------------------------- #
+# list-* commands
+# --------------------------------------------------------------------------- #
+def cmd_list_budgets(token):
+    for b in list_budgets(token):
+        print(f"{b['id']}  {b['name']}")
+
+
+def cmd_list_accounts(token, budget_id):
+    for a in list_accounts(token, budget_id):
+        if a.get("deleted"):
+            continue
+        flag = " [closed]" if a.get("closed") else ""
+        print(f"{a['id']}  {a['name']} ({a['type']}){flag}")
+
+
+def cmd_list_categories(token, budget_id):
+    for g in list_categories(token, budget_id):
+        if g.get("deleted") or g.get("hidden"):
+            continue
+        print(f"# {g['name']}")
+        for c in g.get("categories", []):
+            if c.get("deleted") or c.get("hidden"):
+                continue
+            print(f"  {c['name']}")
+
+
+def cmd_list_payees(token, budget_id):
+    for p in payees_for_output(list_payees(token, budget_id)):
+        print(f"{p['id']}  {p['name']}")
 
 
 # --------------------------------------------------------------------------- #
@@ -470,38 +581,64 @@ def require_token():
     return token
 
 
+def resolve_ids(args, cfg):
+    budget_id = (args.budget_id or os.environ.get("YNAB_BUDGET_ID")
+                 or cfg.get("budget_id"))
+    account_id = (args.account_id or os.environ.get("YNAB_ACCOUNT_ID")
+                  or cfg.get("account_id"))
+    return budget_id, account_id
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="ynab_import.py",
-        description="Load a bank-export CSV into a YNAB budget via the YNAB API.",
+        description="Bridge a bank-export CSV into a YNAB budget (driven by "
+                    "the ynab-import skill).",
     )
-    parser.add_argument("csv", nargs="?", help="path to the bank export CSV")
-    parser.add_argument("--budget-id", help="target budget (saved to config)")
-    parser.add_argument("--account-id", help="target account (saved to config)")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG),
-                        help=f"config file (default: {DEFAULT_CONFIG})")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_common(p, need_budget=False, need_account=False):
+        p.add_argument("--budget-id", help="target budget UUID "
+                       "(or set YNAB_BUDGET_ID)")
+        p.add_argument("--account-id", help="target account UUID "
+                       "(or set YNAB_ACCOUNT_ID)")
+        p.add_argument("--config", default=str(DEFAULT_CONFIG),
+                       help=f"config file (default: {DEFAULT_CONFIG})")
+
     script_dir = Path(__file__).resolve().parent
     default_map = script_dir.parent / "references" / "category_map.json"
-    parser.add_argument("--category-map", default=str(default_map),
-                        help="category map JSON "
-                             "(default: ../references/category_map.json)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="preview only; NO writes to YNAB")
-    parser.add_argument("--keep-transfers", action="store_true",
-                        help="import internal transfer rows instead of skipping")
-    parser.add_argument("--list-budgets", action="store_true",
-                        help="print budget ids + names, then exit")
-    parser.add_argument("--list-accounts", action="store_true",
-                        help="print account ids + names (needs --budget-id)")
-    parser.add_argument("--list-categories", action="store_true",
-                        help="print category groups + names (needs --budget-id)")
+
+    p_prep = sub.add_parser("prepare",
+                            help="parse CSV + fetch live categories/payees -> JSON")
+    p_prep.add_argument("csv", help="path to the bank export CSV")
+    p_prep.add_argument("--category-map", default=str(default_map),
+                        help="optional keyword hint map")
+    p_prep.add_argument("--keep-transfers", action="store_true",
+                        help="include internal transfer rows instead of skipping")
+    add_common(p_prep)
+
+    p_apply = sub.add_parser("apply",
+                             help="create resolved transactions in YNAB")
+    p_apply.add_argument("resolved",
+                         help="JSON file of resolved transactions")
+    p_apply.add_argument("--dry-run", action="store_true",
+                         help="print the exact payload; send nothing")
+    add_common(p_apply)
+
+    p_lb = sub.add_parser("list-budgets", help="print budget ids + names")
+    add_common(p_lb)
+    p_la = sub.add_parser("list-accounts", help="print account ids + names")
+    add_common(p_la)
+    p_lc = sub.add_parser("list-categories", help="print category groups + names")
+    add_common(p_lc)
+    p_lp = sub.add_parser("list-payees", help="print payee ids + names")
+    add_common(p_lp)
+
     args = parser.parse_args(argv)
-
     cfg = load_config(args.config)
-    budget_id = args.budget_id or cfg.get("budget_id")
-    account_id = args.account_id or cfg.get("account_id")
+    budget_id, account_id = resolve_ids(args, cfg)
 
-    # Persist supplied ids (not secrets).
+    # Persist supplied ids (not secrets) for later runs.
     if args.budget_id or args.account_id:
         if args.budget_id:
             cfg["budget_id"] = args.budget_id
@@ -509,113 +646,38 @@ def main(argv=None):
             cfg["account_id"] = args.account_id
         save_config(args.config, cfg)
 
-    # --- list commands ---
-    if args.list_budgets:
-        token = require_token()
-        try:
-            for b in list_budgets(token):
-                print(f"{b['id']}  {b['name']}")
-        except YNABError as e:
-            sys.stderr.write(f"ERROR: {e}\n")
-            sys.exit(1)
-        return
-
-    if args.list_accounts:
-        token = require_token()
-        if not budget_id:
-            parser.error("--list-accounts needs --budget-id (or a saved one)")
-        try:
-            for a in list_accounts(token, budget_id):
-                if a.get("deleted"):
-                    continue
-                flag = " [closed]" if a.get("closed") else ""
-                print(f"{a['id']}  {a['name']} ({a['type']}){flag}")
-        except YNABError as e:
-            sys.stderr.write(f"ERROR: {e}\n")
-            sys.exit(1)
-        return
-
-    if args.list_categories:
-        token = require_token()
-        if not budget_id:
-            parser.error("--list-categories needs --budget-id (or a saved one)")
-        try:
-            for g in list_categories(token, budget_id):
-                if g.get("deleted") or g.get("hidden"):
-                    continue
-                print(f"# {g['name']}")
-                for c in g.get("categories", []):
-                    if c.get("deleted") or c.get("hidden"):
-                        continue
-                    print(f"  {c['name']}")
-        except YNABError as e:
-            sys.stderr.write(f"ERROR: {e}\n")
-            sys.exit(1)
-        return
-
-    # --- import / dry-run path ---
-    if not args.csv:
-        parser.error("a CSV path is required (or use a --list-* command)")
-    if not Path(args.csv).is_file():
-        parser.error(f"CSV not found: {args.csv}")
-
-    category_map = load_category_map(args.category_map)
-    rows = read_bank_csv(args.csv)
-    txns, stats = process_rows(rows, category_map, args.keep_transfers)
-
-    # Fetch live categories so the preview reflects real assignment.
-    cat_index = {}
-    token = get_token()
-    if token:
-        if not budget_id and not args.dry_run:
-            parser.error(
-                "no budget configured. Run with --list-budgets, then "
-                "--budget-id <ID> --list-accounts, then --account-id <ID>."
-            )
-        if budget_id:
-            try:
-                cat_index = build_category_index(
-                    list_categories(token, budget_id))
-            except YNABError as e:
-                if args.dry_run:
-                    sys.stderr.write(
-                        f"WARNING: could not fetch categories ({e}); "
-                        "preview will show uncategorized.\n")
-                else:
-                    sys.stderr.write(f"ERROR: {e}\n")
-                    sys.exit(1)
-    elif not args.dry_run:
-        require_token()  # exits with guidance
-
-    assign_category_ids(txns, cat_index)
-    print_preview(txns, stats)
-
-    if args.dry_run:
-        print("\nDRY RUN: nothing was sent to YNAB.")
-        return
-
-    # Real import requires budget + account.
-    if not budget_id or not account_id:
-        parser.error(
-            "no budget/account configured. Run setup first:\n"
-            "  --list-budgets\n"
-            "  --budget-id <ID> --list-accounts\n"
-            "  --account-id <ID>"
-        )
-    if not txns:
-        print("Nothing to import.")
-        return
-
-    api_txns = build_api_transactions(txns, account_id)
     try:
-        result = create_transactions(token, budget_id, api_txns)
+        if args.command == "list-budgets":
+            cmd_list_budgets(require_token())
+            return
+        if args.command == "list-accounts":
+            if not budget_id:
+                parser.error("list-accounts needs --budget-id / YNAB_BUDGET_ID")
+            cmd_list_accounts(require_token(), budget_id)
+            return
+        if args.command == "list-categories":
+            if not budget_id:
+                parser.error("list-categories needs --budget-id / YNAB_BUDGET_ID")
+            cmd_list_categories(require_token(), budget_id)
+            return
+        if args.command == "list-payees":
+            if not budget_id:
+                parser.error("list-payees needs --budget-id / YNAB_BUDGET_ID")
+            cmd_list_payees(require_token(), budget_id)
+            return
+
+        if args.command == "prepare":
+            if not Path(args.csv).is_file():
+                parser.error(f"CSV not found: {args.csv}")
+            cmd_prepare(args, get_token(), budget_id, account_id)
+            return
+
+        if args.command == "apply":
+            cmd_apply(args, get_token(), budget_id, account_id)
+            return
     except YNABError as e:
         sys.stderr.write(f"ERROR: {e}\n")
         sys.exit(1)
-
-    created = len(result.get("transaction_ids", []))
-    dupes = len(result.get("duplicate_import_ids", []))
-    print(f"DONE: {created} created, {dupes} skipped as duplicates.")
 
 
 if __name__ == "__main__":
