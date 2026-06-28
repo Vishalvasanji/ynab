@@ -1,0 +1,10 @@
+{
+  "_comment": "KEY = a YNAB category name exactly as it appears in the budget; VALUE = list of UPPERCASE substrings matched against the raw bank description. First category with a hit wins (top-to-bottom). A transaction is only categorized if the KEY exists in the budget (case-insensitive); otherwise it lands uncategorized, so a wrong name here is harmless. Keys starting with _ are ignored. Inflows route to 'Inflow: Ready to Assign' automatically.",
+  "Groceries": ["ALDI", "SPROUTS", "ALBERTSONS", "ROUSE", "WM SUPERCENTER", "WALMART"],
+  "Gas": ["EXXON", "CHEVRON", "SHELL SERVICE", "RACETRAC", "CIRCLE K", "B - QUIK", "B QUIK", "B-QUIK", "MARATHON"],
+  "Dining Out": ["TACO BELL", "MCDONALD", "CHICK-FIL-A", "BUFFALO WILD", "POPEYES", "PANDA EXPRESS", "JIMMY JOHNS", "SUBWAY", "JASONSDELI", "EL TIO", "SEOUL STOP", "TOKYO CAFE", "AROMA INDIAN", "CECELIA CREOLE", "HARBOR SEAFOOD", "BONJOUR", "FINBOMB", "MANGOS", "SALAD STATION", "ROMANS CAFE", "BAR AND GRILL", "THE GULF"],
+  "Coffee": ["STARBUCKS", "7 BREW", "SMOOTHIE KING"],
+  "Pets": ["PETSMART", "PETCO"],
+  "Shopping": ["AMAZON"],
+  "Home & Garden": ["HIGHLAND HDWE", "HARDWARE"]
+}
