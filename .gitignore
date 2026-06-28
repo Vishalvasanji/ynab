@@ -1,0 +1,17 @@
+# --- Secrets: NEVER commit the YNAB token or anything that could hold it ---
+.env
+.env.*
+!.env.example
+*.token
+*.secret
+config.json
+.config/
+
+# --- Local bank exports (may contain real financial data) ---
+# Sample/test fixtures may be committed deliberately; force-add them with
+#   git add -f references/sample.csv
+*.csv
+
+# --- Python ---
+__pycache__/
+*.pyc
