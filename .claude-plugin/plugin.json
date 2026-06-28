@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "ynab-import",
+  "displayName": "YNAB Import",
+  "version": "0.1.0",
+  "description": "Import a bank-export CSV into a YNAB budget. Claude matches payees and categories against your live budget, asks about anything ambiguous, dedupes via YNAB's native import_id, and imports to the approval queue.",
+  "author": { "name": "Vishal Vasanji" },
+  "repository": "https://github.com/Vishalvasanji/ynab",
+  "keywords": ["ynab", "budget", "finance", "csv", "bank", "import", "transactions"]
+}

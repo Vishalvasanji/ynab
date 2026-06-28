@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "ynab-tools",
+  "owner": { "name": "Vishal Vasanji" },
+  "description": "Personal marketplace for the ynab-import skill.",
+  "plugins": [
+    {
+      "name": "ynab-import",
+      "source": "./",
+      "description": "Import a bank-export CSV into a YNAB budget with Claude-driven payee/category matching, ambiguity questions, and import_id dedup."
+    }
+  ]
+}

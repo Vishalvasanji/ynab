@@ -36,6 +36,11 @@ developer-settings page. Surface that to the user rather than guessing a token.
 
 ## The flow Claude should follow
 
+> **Script path.** Commands below use `"${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py"`.
+> When this skill is installed as a plugin (Cowork / `claude plugin install`),
+> `CLAUDE_PLUGIN_ROOT` points at the installed plugin dir; when you're working in
+> the repo itself it falls back to `.` (the repo root). Either way it resolves.
+
 When the user gives you a CSV to import, do this:
 
 ### 1. Confirm setup
@@ -43,13 +48,13 @@ Make sure a budget and account are resolvable (config, env, or ask the user). If
 not, run `list-budgets`, then `list-accounts`, and ask which to use:
 
 ```bash
-python3 scripts/ynab_import.py list-budgets
-python3 scripts/ynab_import.py list-accounts --budget-id <BUDGET_ID>
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" list-budgets
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" list-accounts --budget-id <BUDGET_ID>
 ```
 
 ### 2. prepare — parse + fetch live data
 ```bash
-python3 scripts/ynab_import.py prepare <CSV> > prepared.json
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" prepare <CSV> > prepared.json
 ```
 This emits one JSON object:
 ```jsonc
@@ -107,9 +112,9 @@ Produce `resolved.json` (you can keep the whole prepared object and just add
 
 ### 5. Preview, confirm, apply
 ```bash
-python3 scripts/ynab_import.py apply resolved.json --dry-run   # exact payload, sends nothing
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" apply resolved.json --dry-run   # exact payload, sends nothing
 # show the user the preview, get a yes, then:
-python3 scripts/ynab_import.py apply resolved.json
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" apply resolved.json
 ```
 `apply` creates everything as `approved: false` / `cleared: "cleared"` (so it
 lands in YNAB's approval queue) and deduplicates via `import_id`. It prints
@@ -133,9 +138,9 @@ duplicates are dropped by YNAB.
 ## Other commands
 
 ```bash
-python3 scripts/ynab_import.py list-categories --budget-id <ID>   # real category names
-python3 scripts/ynab_import.py list-payees     --budget-id <ID>   # real payee names
-python3 scripts/ynab_import.py list-known-accounts               # budget+accounts from the reference (offline)
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" list-categories --budget-id <ID>   # real category names
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" list-payees     --budget-id <ID>   # real payee names
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" list-known-accounts               # budget+accounts from the reference (offline)
 ```
 
 ## Known accounts reference (`references/accounts.json`)

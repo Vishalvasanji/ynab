@@ -42,6 +42,38 @@ python3 scripts/ynab_import.py list-accounts --budget-id <BUDGET_ID>
 
 After that, just hand Claude a CSV and say "import this into YNAB."
 
+## Install it as a plugin (Claude Code & Cowork)
+
+This repo is also a one-plugin **marketplace** (`.claude-plugin/marketplace.json`
++ `.claude-plugin/plugin.json`), so the same skill installs cleanly into Claude
+Code and Cowork — no copying files around.
+
+**Claude Code (CLI):**
+```bash
+/plugin marketplace add Vishalvasanji/ynab
+/plugin install ynab-import@ynab-tools
+```
+
+**Cowork:**
+- *Just you:* **Customize → Plugins → Browse / Add**, point it at this GitHub repo.
+- *Whole org:* **Organization settings → Plugins → Add plugin → GitHub**, select
+  `Vishalvasanji/ynab`. Cowork auto-syncs new commits.
+
+After installing, set the same credentials in that environment:
+
+| What | How | Secret? |
+|---|---|---|
+| `YNAB_ACCESS_TOKEN` | environment variable | **Yes** — never in chat or git |
+| `YNAB_BUDGET_ID` / `YNAB_ACCOUNT_ID` | environment variables | No |
+
+The skill's commands use `${CLAUDE_PLUGIN_ROOT}` so they resolve whether it's run
+from this repo or from the installed plugin. The environment must allow outbound
+HTTPS to `api.ynab.com`.
+
+> Note: claude.ai **chat** is intentionally not supported — its sandbox has no
+> secret store and its connectors require a hosted OAuth MCP server. Use Claude
+> Code or Cowork.
+
 ## CI
 
 `.github/workflows/ci.yml` auto-tests the skill on every push/PR (offline
