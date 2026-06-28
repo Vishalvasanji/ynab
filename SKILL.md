@@ -110,6 +110,20 @@ Produce `resolved.json` (you can keep the whole prepared object and just add
 `date`, `amount_milli`, `import_id`. Optional: `payee_id` **or** `payee_name`,
 `category_id`, `memo`.
 
+### 4b. (Preferred) Review & approve in the HTML form
+Instead of resolving every gap in chat, generate a self-contained review form,
+pre-filled with your first-pass guesses, and let the user fix gaps + approve in a
+browser:
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" build-review prepared.json \
+  --initial resolved.json -o /tmp/ynab-review.html
+```
+Send that HTML file to the user (it is self-contained; data stays in the file,
+never committed). They open it, fix the highlighted rows (uncategorized or new
+payee), click **Approve & Download resolved.json**, and hand that file back. Then
+go to step 5 with the returned `resolved.json`. (Resolving in chat is the
+fallback when a browser round-trip isn't practical.)
+
 ### 5. Preview, confirm, apply
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT:-.}/scripts/ynab_import.py" apply resolved.json --dry-run   # exact payload, sends nothing

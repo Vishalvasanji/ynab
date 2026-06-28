@@ -37,6 +37,9 @@ DEFAULT_CONFIG = Path.home() / ".config" / "ynab-import" / "config.json"
 # script resolve a budget/account by name and supply a sensible default.
 DEFAULT_ACCOUNTS_REF = (Path(__file__).resolve().parent.parent
                         / "references" / "accounts.json")
+# Committed, data-free HTML form template for the review/approve step.
+DEFAULT_REVIEW_TEMPLATE = (Path(__file__).resolve().parent.parent
+                           / "web" / "review.template.html")
 PAYEE_MAX = 50
 MEMO_MAX = 200
 IMPORT_ID_MAX = 36
@@ -616,6 +619,91 @@ def cmd_list_known_accounts(ref):
         print(f"  {acct.get('id')}  {acct.get('name')}{typ}{star}")
 
 
+def account_name_for_id(ref, account_id):
+    """Reverse-lookup an account name from the reference (or None)."""
+    for acct in ref.get("accounts", []) or []:
+        if acct.get("id") == account_id:
+            return acct.get("name")
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# build-review — populate the HTML form for human review/approval
+# --------------------------------------------------------------------------- #
+def cmd_build_review(args, ref):
+    """Inject prepared data (+ optional initial assignments) into the HTML
+    template and write a populated, self-contained review form. No network."""
+    try:
+        with open(args.prepared, "r", encoding="utf-8") as fh:
+            prep = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        sys.stderr.write(f"ERROR: could not read prepared file: {e}\n")
+        sys.exit(1)
+
+    # Optional initial assignments (Claude's first-pass guesses), keyed by
+    # import_id, merged onto the transactions so the form pre-fills them.
+    initial = {}
+    if args.initial:
+        try:
+            with open(args.initial, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+            rows = doc.get("transactions", doc) if isinstance(doc, dict) else doc
+            for r in rows or []:
+                if r.get("import_id"):
+                    initial[r["import_id"]] = r
+        except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+            sys.stderr.write(f"WARNING: could not read --initial ({e}); "
+                             "form will use suggested/hint values.\n")
+
+    txns = []
+    for t in prep.get("transactions", []):
+        row = {
+            "date": t["date"], "amount_milli": t["amount_milli"],
+            "import_id": t["import_id"], "memo": t.get("memo", ""),
+            "raw_description": t.get("raw_description", ""),
+            "suggested_payee": t.get("suggested_payee", ""),
+            "inflow": t.get("inflow", False),
+        }
+        g = initial.get(t["import_id"], {})
+        # Prefer explicit initial assignment; else fall back to prepare hints.
+        if g.get("payee_id"):
+            row["payee_id"] = g["payee_id"]
+        elif g.get("payee_name"):
+            row["payee_name"] = g["payee_name"]
+        if "category_id" in g:
+            row["category_id"] = g.get("category_id")
+        elif t.get("hint_category_id"):
+            row["category_id"] = t["hint_category_id"]
+        txns.append(row)
+
+    data = {
+        "budget_id": prep.get("budget_id"),
+        "account_id": prep.get("account_id"),
+        "account_name": account_name_for_id(ref, prep.get("account_id")),
+        "categories": prep.get("categories", []),
+        "payees": prep.get("payees", []),
+        "transactions": txns,
+    }
+
+    try:
+        template = Path(args.template).read_text(encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"ERROR: could not read template {args.template}: {e}\n")
+        sys.exit(1)
+    if "__YNAB_DATA__" not in template:
+        sys.stderr.write("ERROR: template is missing the __YNAB_DATA__ placeholder.\n")
+        sys.exit(1)
+
+    # Inject as a JSON literal; escape </ so the blob can't close the <script>.
+    blob = json.dumps(data).replace("</", "<\\/")
+    html = template.replace("__YNAB_DATA__", blob)
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    sys.stderr.write(f"Wrote review form: {out} ({len(txns)} transactions)\n")
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -696,6 +784,18 @@ def main(argv=None):
                          help="print the exact payload; send nothing")
     add_common(p_apply)
 
+    p_rev = sub.add_parser("build-review",
+                           help="populate the HTML review/approve form from a "
+                                "prepared.json (offline; no token)")
+    p_rev.add_argument("prepared", help="prepare output JSON")
+    p_rev.add_argument("--initial", help="optional resolved.json of first-pass "
+                       "payee/category guesses to pre-fill")
+    p_rev.add_argument("--template", default=str(DEFAULT_REVIEW_TEMPLATE),
+                       help=f"HTML template (default: {DEFAULT_REVIEW_TEMPLATE})")
+    p_rev.add_argument("-o", "--output", required=True,
+                       help="output HTML path (keep OUT of git; contains data)")
+    add_common(p_rev)
+
     p_lb = sub.add_parser("list-budgets", help="print budget ids + names")
     add_common(p_lb)
     p_la = sub.add_parser("list-accounts", help="print account ids + names")
@@ -753,6 +853,10 @@ def main(argv=None):
 
         if args.command == "apply":
             cmd_apply(args, get_token(), budget_id, account_id)
+            return
+
+        if args.command == "build-review":
+            cmd_build_review(args, ref)
             return
     except YNABError as e:
         sys.stderr.write(f"ERROR: {e}\n")

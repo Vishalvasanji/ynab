@@ -12,6 +12,15 @@ config.json
 #   git add -f references/sample.csv
 *.csv
 
+# --- Populated review forms & resolved data (contain real transaction data) ---
+# Ignore every generated HTML in web/ EXCEPT the committed, data-free template.
+web/*.html
+!web/review.template.html
+*.out.html
+ynab-review*.html
+resolved*.json
+prepared*.json
+
 # --- Python ---
 __pycache__/
 *.pyc

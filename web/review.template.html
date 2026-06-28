@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YNAB Import — Review &amp; Approve</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#272c37; --txt:#e6e8ee;
+          --mut:#9aa3b2; --accent:#3b82f6; --warn:#f59e0b; --in:#22c55e;
+          --out:#f87171; --flag:#3a2a14; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { position:sticky; top:0; z-index:5; background:var(--panel);
+           border-bottom:1px solid var(--line); padding:14px 18px; }
+  h1 { margin:0 0 4px; font-size:17px; }
+  .sub { color:var(--mut); font-size:13px; }
+  .bar { display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:10px; }
+  .counts span { margin-right:14px; }
+  .pill { background:#222838; border:1px solid var(--line); border-radius:999px;
+          padding:2px 10px; color:var(--mut); }
+  .pill b { color:var(--txt); }
+  input[type=search], .filter { background:#0c0e13; color:var(--txt);
+          border:1px solid var(--line); border-radius:7px; padding:7px 10px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px;
+           padding:9px 16px; font-weight:600; cursor:pointer; }
+  button.secondary { background:#2a2f3b; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  main { padding:0 18px 120px; }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  thead th { position:sticky; top:96px; background:var(--bg); text-align:left;
+             color:var(--mut); font-weight:600; padding:8px 8px; border-bottom:1px solid var(--line);
+             font-size:12px; text-transform:uppercase; letter-spacing:.04em; z-index:4; }
+  tbody td { padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  tr.flag td { background:var(--flag); }
+  tr.hidden { display:none; }
+  .amt { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .amt.in { color:var(--in); } .amt.out { color:var(--out); }
+  .memo { color:var(--mut); font-size:12px; max-width:340px; overflow:hidden;
+          text-overflow:ellipsis; white-space:nowrap; }
+  .date { color:var(--mut); white-space:nowrap; }
+  td input.payee { width:230px; background:#0c0e13; color:var(--txt);
+          border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  td input.payee.new { border-color:var(--warn); }
+  td select.cat { width:230px; background:#0c0e13; color:var(--txt);
+          border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  td select.cat.empty { border-color:var(--warn); }
+  .tag { font-size:11px; color:var(--warn); margin-left:6px; }
+  footer { position:fixed; bottom:0; left:0; right:0; background:var(--panel);
+           border-top:1px solid var(--line); padding:12px 18px; display:flex;
+           gap:12px; align-items:center; }
+  footer .grow { flex:1; color:var(--mut); }
+  .ok { color:var(--in); }
+  code { background:#0c0e13; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>YNAB Import — Review &amp; Approve</h1>
+  <div class="sub" id="subtitle">—</div>
+  <div class="bar">
+    <input type="search" id="search" placeholder="Search payee / memo…">
+    <label class="filter"><input type="checkbox" id="onlyFlag"> Only rows needing input</label>
+    <div class="counts" id="counts"></div>
+  </div>
+</header>
+
+<main>
+  <table>
+    <thead><tr>
+      <th>Date</th><th class="amt">Amount</th><th>Memo (bank description)</th>
+      <th>Payee</th><th>Category</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+
+<footer>
+  <div class="grow" id="status">Review the highlighted rows, then approve.</div>
+  <button class="secondary" id="copyBtn">Copy JSON</button>
+  <button id="approveBtn">Approve &amp; Download resolved.json</button>
+</footer>
+
+<!-- The generator (ynab_import.py build-review) replaces __YNAB_DATA__ with a JSON literal. -->
+<script>window.YNAB_DATA = __YNAB_DATA__;</script>
+<script>
+(function () {
+  const D = window.YNAB_DATA || {};
+  const cats = D.categories || [];
+  const payees = D.payees || [];
+  const txns = D.transactions || [];
+
+  // name(lower) -> payee id, for resolving the payee input back to an id.
+  const payeeByName = {};
+  payees.forEach(p => { payeeByName[p.name.trim().toLowerCase()] = p.id; });
+  const catById = {}; cats.forEach(c => catById[c.id] = c);
+
+  document.getElementById('subtitle').textContent =
+    `Budget account: ${D.account_name || D.account_id || '?'} · ${txns.length} transactions · ` +
+    `imports as “approved: false” (lands in YNAB's approval queue) · de-duplicated by import_id`;
+
+  // Build the shared payee datalist + category optgroups once.
+  const dl = document.createElement('datalist'); dl.id = 'payeelist';
+  payees.forEach(p => { const o=document.createElement('option'); o.value=p.name; dl.appendChild(o); });
+  document.body.appendChild(dl);
+
+  const groups = {};
+  cats.forEach(c => { (groups[c.group] = groups[c.group] || []).push(c); });
+  function categorySelect(selectedId) {
+    const sel = document.createElement('select'); sel.className = 'cat';
+    const none = document.createElement('option'); none.value=''; none.textContent='— Uncategorized —';
+    sel.appendChild(none);
+    Object.keys(groups).forEach(g => {
+      const og = document.createElement('optgroup'); og.label = g;
+      groups[g].forEach(c => {
+        const o = document.createElement('option'); o.value=c.id; o.textContent=c.name;
+        if (c.id === selectedId) o.selected = true;
+        og.appendChild(o);
+      });
+      sel.appendChild(og);
+    });
+    return sel;
+  }
+
+  const tbody = document.getElementById('rows');
+  const state = []; // parallel to rows: {t, payeeEl, catEl, tr}
+
+  function fmtAmt(milli) {
+    const v = milli/1000;
+    return (v<0?'-':'') + '$' + Math.abs(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  }
+
+  txns.forEach(t => {
+    const tr = document.createElement('tr');
+    // initial payee text: payee_id -> its name; else payee_name; else suggested
+    let payeeText = '';
+    if (t.payee_id && catNameForPayee(t.payee_id)) payeeText = catNameForPayee(t.payee_id);
+    else if (t.payee_name) payeeText = t.payee_name;
+    else payeeText = t.suggested_payee || '';
+
+    const tdDate = document.createElement('td'); tdDate.className='date'; tdDate.textContent=t.date;
+    const tdAmt = document.createElement('td'); tdAmt.className='amt '+(t.amount_milli<0?'out':'in');
+    tdAmt.textContent = fmtAmt(t.amount_milli);
+    const tdMemo = document.createElement('td'); tdMemo.className='memo'; tdMemo.title=t.memo||t.raw_description||'';
+    tdMemo.textContent = t.raw_description || t.memo || '';
+
+    const tdPayee = document.createElement('td');
+    const pin = document.createElement('input'); pin.className='payee'; pin.setAttribute('list','payeelist');
+    pin.value = payeeText; tdPayee.appendChild(pin);
+
+    const tdCat = document.createElement('td');
+    const csel = categorySelect(t.category_id || '');
+    tdCat.appendChild(csel);
+
+    tr.append(tdDate, tdAmt, tdMemo, tdPayee, tdCat);
+    tbody.appendChild(tr);
+    const s = {t, payeeEl:pin, catEl:csel, tr};
+    state.push(s);
+
+    pin.addEventListener('input', () => { refreshRow(s); recount(); });
+    csel.addEventListener('change', () => { refreshRow(s); recount(); });
+    refreshRow(s);
+  });
+
+  function catNameForPayee(id) {
+    const p = payees.find(x => x.id === id); return p ? p.name : '';
+  }
+  function isNewPayee(name) {
+    const n = (name||'').trim().toLowerCase();
+    return n !== '' && !(n in payeeByName);
+  }
+  function refreshRow(s) {
+    const newP = isNewPayee(s.payeeEl.value);
+    s.payeeEl.classList.toggle('new', newP);
+    const emptyC = s.catEl.value === '';
+    s.catEl.classList.toggle('empty', emptyC);
+    s.flagged = newP || emptyC;
+    s.tr.classList.toggle('flag', s.flagged);
+  }
+
+  const search = document.getElementById('search');
+  const onlyFlag = document.getElementById('onlyFlag');
+  function applyFilter() {
+    const q = search.value.trim().toLowerCase();
+    state.forEach(s => {
+      const hay = (s.payeeEl.value + ' ' + (s.t.raw_description||'') + ' ' + (s.t.memo||'')).toLowerCase();
+      let show = (!q || hay.includes(q)) && (!onlyFlag.checked || s.flagged);
+      s.tr.classList.toggle('hidden', !show);
+    });
+  }
+  search.addEventListener('input', applyFilter);
+  onlyFlag.addEventListener('change', applyFilter);
+
+  function recount() {
+    let flagged=0, cat=0, newp=0;
+    state.forEach(s => { if (s.flagged) flagged++; if (s.catEl.value) cat++; if (isNewPayee(s.payeeEl.value)) newp++; });
+    document.getElementById('counts').innerHTML =
+      `<span class="pill">total <b>${state.length}</b></span>` +
+      `<span class="pill">needs input <b>${flagged}</b></span>` +
+      `<span class="pill">categorized <b>${cat}</b></span>` +
+      `<span class="pill">new payees <b>${newp}</b></span>`;
+    applyFilter();
+  }
+  recount();
+
+  function buildResolved() {
+    const out = { budget_id: D.budget_id, account_id: D.account_id, transactions: [] };
+    state.forEach(s => {
+      const t = s.t;
+      const o = { date:t.date, amount_milli:t.amount_milli, import_id:t.import_id };
+      if (t.memo) o.memo = t.memo;
+      const name = (s.payeeEl.value||'').trim();
+      if (name) {
+        const id = payeeByName[name.toLowerCase()];
+        if (id) o.payee_id = id; else o.payee_name = name;
+      }
+      if (s.catEl.value) o.category_id = s.catEl.value;
+      out.transactions.push(o);
+    });
+    return out;
+  }
+
+  function download(text, filename) {
+    const blob = new Blob([text], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+  }
+
+  document.getElementById('approveBtn').addEventListener('click', () => {
+    const doc = buildResolved();
+    download(JSON.stringify(doc, null, 2), 'resolved.json');
+    document.getElementById('status').innerHTML =
+      '<span class="ok">✓ Downloaded resolved.json</span> — upload it back to Claude Code and say “apply it”.';
+  });
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const doc = buildResolved();
+    try { await navigator.clipboard.writeText(JSON.stringify(doc, null, 2));
+      document.getElementById('status').innerHTML = '<span class="ok">✓ Copied resolved JSON to clipboard.</span>';
+    } catch(e) { document.getElementById('status').textContent = 'Copy failed — use the Download button.'; }
+  });
+})();
+</script>
+</body>
+</html>

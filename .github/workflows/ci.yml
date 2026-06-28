@@ -64,3 +64,19 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "nothing was sent to YNAB" \
             || { echo "::error::apply --dry-run did not no-op"; exit 1; }
+
+      - name: build-review populates the form (offline)
+        run: |
+          python3 scripts/ynab_import.py prepare references/sample.csv > prep.json
+          python3 scripts/ynab_import.py build-review prep.json -o review.out.html
+          python3 - <<'PY'
+          import re, json
+          html = open("review.out.html", encoding="utf-8").read()
+          assert "__YNAB_DATA__" not in html, "placeholder not replaced"
+          m = re.search(r'window\.YNAB_DATA = (\{.*?\});</script>', html, re.S)
+          assert m, "injected data block not found"
+          d = json.loads(m.group(1).replace('<\\/', '</'))
+          assert len(d["transactions"]) == 10, len(d["transactions"])
+          assert all(t.get("import_id") for t in d["transactions"])
+          print("OK: build-review injected 10 transactions into the form")
+          PY
