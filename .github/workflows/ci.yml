@@ -1,0 +1,66 @@
+name: CI
+
+# Auto-tests the ynab-import skill on every push/PR. No secrets, no writes to
+# your budget — it only runs the offline `prepare` step against the committed
+# fixture (which degrades gracefully without a token).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile-check the script
+        run: python -m py_compile scripts/ynab_import.py
+
+      - name: prepare against the sample fixture (offline, no token)
+        run: |
+          python3 scripts/ynab_import.py prepare references/sample.csv > prep.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("prep.json"))
+          assert d["skipped"] == {"transfers": 1, "zero": 1, "bad_date": 0}, d["skipped"]
+          assert len(d["transactions"]) == 10, len(d["transactions"])
+          print("OK: prepare emitted 10 txns; 1 transfer + 1 zero row skipped")
+          PY
+
+      - name: Assert import_id / milliunit / payee-cleanup invariants
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          sys.path.insert(0, "scripts")
+          import ynab_import as y
+          rows = y.read_bank_csv("references/sample.csv")
+          txns, stats = y.process_rows(
+              rows, y.load_category_map("references/category_map.json"), False)
+          ids = [t["import_id"] for t in txns]
+          assert all(re.fullmatch(r"YNAB:-?\d+:\d{4}-\d{2}-\d{2}:\d+", i) for i in ids), ids
+          assert "YNAB:-13000:2026-06-10:1" in ids and "YNAB:-13000:2026-06-10:2" in ids, ids
+          taco = next(t for t in txns if "TACO BELL" in t["suggested_payee"])
+          assert taco["amount_milli"] == -24880, taco
+          assert taco["suggested_payee"] == "TACO BELL 034632 BATON ROUGE", taco
+          print("OK: import_id, milliunits, and payee assertions passed")
+          PY
+
+      - name: apply --dry-run writes nothing
+        run: |
+          cat > resolved.json <<'JSON'
+          {"account_id":"a-1","budget_id":"b-1","transactions":[
+            {"date":"2026-06-27","amount_milli":-24880,"import_id":"YNAB:-24880:2026-06-27:1","payee_name":"Taco Bell"}
+          ]}
+          JSON
+          out="$(python3 scripts/ynab_import.py apply resolved.json --dry-run)"
+          echo "$out"
+          echo "$out" | grep -q "nothing was sent to YNAB" \
+            || { echo "::error::apply --dry-run did not no-op"; exit 1; }
