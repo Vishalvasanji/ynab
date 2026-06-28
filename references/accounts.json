@@ -1,0 +1,15 @@
+{
+  "_comment": "Known YNAB budget + account IDs for this user. NOT secrets (only the YNAB_ACCESS_TOKEN is). The ynab-import script reads this to resolve a budget/account by name and to provide a default budget+account. Keep names in sync with YNAB; refresh by re-running `list-budgets` / `list-accounts`.",
+  "budget": {
+    "name": "2026 Budget",
+    "id": "8bf164d8-f458-4edb-902b-dedf7d5c5109"
+  },
+  "default_account": "LESFCU Checking",
+  "accounts": [
+    { "name": "Chime Checking",  "id": "4f6c2614-11e2-4214-b098-753b93952e76", "type": "checking" },
+    { "name": "LESFCU Checking", "id": "543a424b-03db-4697-8fd2-8328f3555b9a", "type": "checking" },
+    { "name": "LESFCU Saving",   "id": "5d9c1465-cd24-4914-9c7e-037644cbab49", "type": "savings" },
+    { "name": "Chime Savings",   "id": "7d20de50-120d-4cd2-9ff7-03f148f9534a", "type": "savings" },
+    { "name": "Cash Held",       "id": "10c617be-3c43-435d-a7be-5ff692059363", "type": "cash" }
+  ]
+}

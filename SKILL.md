@@ -21,10 +21,15 @@ session and Claude drives the two-phase flow below.
    `export YNAB_ACCESS_TOKEN=...` or use a gitignored `.env`
    (`set -a; source .env; set +a`). Get a token at
    <https://app.ynab.com/settings/developer>.
-2. **Budget + account IDs** (not secrets). Provide via `--budget-id`/`--account-id`,
-   the `YNAB_BUDGET_ID`/`YNAB_ACCOUNT_ID` env vars, or let the script save them to
-   `~/.config/ynab-import/config.json` on first use. Find them with
-   `list-budgets` and `list-accounts` (below).
+2. **Budget + account IDs** (not secrets). Resolution order, highest first:
+   `--budget-id`/`--account-id` flags → `--account "<name>"` (resolved via the
+   reference) → `YNAB_BUDGET_ID`/`YNAB_ACCOUNT_ID` env vars →
+   `~/.config/ynab-import/config.json` → the committed
+   `references/accounts.json` reference (lowest-precedence default). So with the
+   reference populated, the script already knows every account and a sensible
+   default — you only pass a flag to override. Find/refresh IDs with
+   `list-budgets` and `list-accounts` (below); view what's already known offline
+   with `list-known-accounts`.
 
 If the token is missing, the script exits with a message pointing to the YNAB
 developer-settings page. Surface that to the user rather than guessing a token.
@@ -130,7 +135,20 @@ duplicates are dropped by YNAB.
 ```bash
 python3 scripts/ynab_import.py list-categories --budget-id <ID>   # real category names
 python3 scripts/ynab_import.py list-payees     --budget-id <ID>   # real payee names
+python3 scripts/ynab_import.py list-known-accounts               # budget+accounts from the reference (offline)
 ```
+
+## Known accounts reference (`references/accounts.json`)
+
+`references/accounts.json` is a committed, **non-secret** map of the budget and
+**all** account IDs, plus a `default_account`. The script reads it as the
+lowest-precedence source for budget/account resolution, and any command accepts
+`--account "<name>"` to target a known account by name (e.g.
+`--account "LESFCU Saving"`) instead of pasting a UUID. This is the hook for
+expanding the skill: new capabilities (multi-account imports, transfers between
+known accounts, routing a statement to the right account) can resolve any
+account by name from this one file. Refresh it by re-running `list-accounts` and
+updating the entries — keep names matching YNAB.
 
 `references/category_map.json` is an **optional** keyword hint map (merchant
 substrings → category name) that pre-fills `hint_category_id`. It only ever

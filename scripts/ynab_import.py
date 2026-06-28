@@ -33,6 +33,10 @@ from pathlib import Path
 
 API_BASE = "https://api.ynab.com/v1"
 DEFAULT_CONFIG = Path.home() / ".config" / "ynab-import" / "config.json"
+# Committed reference of known budget + account IDs (NOT secrets). Lets the
+# script resolve a budget/account by name and supply a sensible default.
+DEFAULT_ACCOUNTS_REF = (Path(__file__).resolve().parent.parent
+                        / "references" / "accounts.json")
 PAYEE_MAX = 50
 MEMO_MAX = 200
 IMPORT_ID_MAX = 36
@@ -332,6 +336,40 @@ def save_config(path, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# Known accounts reference (committed; budget + all account IDs, NOT secrets)
+# --------------------------------------------------------------------------- #
+def load_accounts_ref(path):
+    """Load references/accounts.json. Returns {} if absent/unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            ref = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return ref if isinstance(ref, dict) else {}
+
+
+def ref_budget_id(ref):
+    budget = ref.get("budget") if isinstance(ref, dict) else None
+    return budget.get("id") if isinstance(budget, dict) else None
+
+
+def resolve_account_name(ref, name):
+    """Case-insensitive account-name -> id over the reference. None if no match."""
+    if not name:
+        return None
+    target = name.strip().lower()
+    for acct in ref.get("accounts", []) or []:
+        if str(acct.get("name", "")).strip().lower() == target:
+            return acct.get("id")
+    return None
+
+
+def ref_default_account_id(ref):
+    """The reference's default account id (by default_account name)."""
+    return resolve_account_name(ref, ref.get("default_account")) if ref else None
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
 def process_rows(rows, category_map, keep_transfers):
@@ -560,6 +598,24 @@ def cmd_list_payees(token, budget_id):
         print(f"{p['id']}  {p['name']}")
 
 
+def cmd_list_known_accounts(ref):
+    """Print budget + accounts from the committed reference (no API call)."""
+    if not ref:
+        sys.stderr.write(
+            "No accounts reference found. Expected references/accounts.json "
+            "(or pass --accounts-ref). Run `list-budgets` / `list-accounts` "
+            "to fetch IDs and populate it.\n")
+        sys.exit(1)
+    budget = ref.get("budget") or {}
+    if budget:
+        print(f"Budget: {budget.get('name')}  {budget.get('id')}")
+    default = ref.get("default_account")
+    for acct in ref.get("accounts", []) or []:
+        star = " *default" if acct.get("name") == default else ""
+        typ = f" ({acct['type']})" if acct.get("type") else ""
+        print(f"  {acct.get('id')}  {acct.get('name')}{typ}{star}")
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -581,11 +637,21 @@ def require_token():
     return token
 
 
-def resolve_ids(args, cfg):
+def resolve_ids(args, cfg, ref):
+    """Resolve (budget_id, account_id) by precedence.
+
+    budget:  --budget-id > YNAB_BUDGET_ID > config.json > accounts.json
+    account: --account-id > --account NAME > YNAB_ACCOUNT_ID > config.json
+             > accounts.json default_account
+    The committed accounts.json reference is the lowest-precedence fallback, so
+    explicit flags/env/config always win.
+    """
     budget_id = (args.budget_id or os.environ.get("YNAB_BUDGET_ID")
-                 or cfg.get("budget_id"))
-    account_id = (args.account_id or os.environ.get("YNAB_ACCOUNT_ID")
-                  or cfg.get("account_id"))
+                 or cfg.get("budget_id") or ref_budget_id(ref))
+    account_id = (args.account_id
+                  or resolve_account_name(ref, getattr(args, "account", None))
+                  or os.environ.get("YNAB_ACCOUNT_ID")
+                  or cfg.get("account_id") or ref_default_account_id(ref))
     return budget_id, account_id
 
 
@@ -602,8 +668,13 @@ def main(argv=None):
                        "(or set YNAB_BUDGET_ID)")
         p.add_argument("--account-id", help="target account UUID "
                        "(or set YNAB_ACCOUNT_ID)")
+        p.add_argument("--account", help="target account by NAME, resolved via "
+                       "the known-accounts reference (e.g. 'LESFCU Checking')")
         p.add_argument("--config", default=str(DEFAULT_CONFIG),
                        help=f"config file (default: {DEFAULT_CONFIG})")
+        p.add_argument("--accounts-ref", default=str(DEFAULT_ACCOUNTS_REF),
+                       help="known budget/account IDs reference "
+                       f"(default: {DEFAULT_ACCOUNTS_REF})")
 
     script_dir = Path(__file__).resolve().parent
     default_map = script_dir.parent / "references" / "category_map.json"
@@ -633,10 +704,15 @@ def main(argv=None):
     add_common(p_lc)
     p_lp = sub.add_parser("list-payees", help="print payee ids + names")
     add_common(p_lp)
+    p_lk = sub.add_parser("list-known-accounts",
+                          help="print budget + account IDs from the committed "
+                               "reference (offline; no token needed)")
+    add_common(p_lk)
 
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-    budget_id, account_id = resolve_ids(args, cfg)
+    ref = load_accounts_ref(args.accounts_ref)
+    budget_id, account_id = resolve_ids(args, cfg, ref)
 
     # Persist supplied ids (not secrets) for later runs.
     if args.budget_id or args.account_id:
@@ -647,6 +723,9 @@ def main(argv=None):
         save_config(args.config, cfg)
 
     try:
+        if args.command == "list-known-accounts":
+            cmd_list_known_accounts(ref)
+            return
         if args.command == "list-budgets":
             cmd_list_budgets(require_token())
             return
